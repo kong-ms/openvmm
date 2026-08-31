@@ -65,6 +65,7 @@ use petri_artifacts_core::ResolvedArtifact;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::time::Duration;
 use tempfile::TempPath;
 use unix_socket::UnixListener;
@@ -146,6 +147,9 @@ impl PetriVmmBackend for OpenVmmPetriBackend {
         if let Some(f) = modify_vmm_config {
             config = f.0(config);
         }
+        if let Some(timing) = &resources.startup_timing {
+            timing.lock().unwrap().mark_device_setup_end();
+        }
 
         config.run().await
     }
@@ -170,6 +174,8 @@ pub struct PetriVmConfigOpenVmm {
 
     // File-backed guest memory.
     memory_backing_file: Option<PathBuf>,
+
+    startup_timing: Option<Arc<Mutex<crate::StartupTiming>>>,
 
     // The private-memory setting explicitly requested via
     // `MemoryConfig::private_memory`, preserved so that backend methods which

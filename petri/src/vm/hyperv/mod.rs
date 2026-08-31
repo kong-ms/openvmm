@@ -173,7 +173,9 @@ impl PetriVmmBackend for HyperVPetriBackend {
         resources: &PetriVmResources,
         properties: PetriVmProperties,
     ) -> anyhow::Result<(Self::VmRuntime, PetriVmRuntimeConfig)> {
-        let PetriVmResources { driver, log_source } = resources;
+        let PetriVmResources {
+            driver, log_source, ..
+        } = resources;
 
         assert!(matches!(
             config.host_log_levels,

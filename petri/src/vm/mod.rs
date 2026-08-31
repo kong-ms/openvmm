@@ -50,6 +50,8 @@ use std::hash::Hasher;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::Mutex;
+use std::time::Instant;
 use std::time::Duration;
 use tempfile::TempPath;
 use vmgs_resources::GuestStateEncryptionPolicy;
@@ -192,6 +194,7 @@ pub struct PetriVmBuilder<T: PetriVmmBackend> {
     no_vmbus: bool,
     // Disable the hypervisor (HV#1) enlightenments. Implies `no_vmbus`.
     no_hv: bool,
+    startup_timing: Option<Arc<Mutex<StartupTiming>>>,
 }
 
 impl<T: PetriVmmBackend> Debug for PetriVmBuilder<T> {
@@ -334,6 +337,97 @@ pub struct PetriVmRuntimeConfig {
 pub struct PetriVmResources {
     driver: DefaultDriver,
     log_source: PetriLogSource,
+    pub(crate) startup_timing: Option<Arc<Mutex<StartupTiming>>>,
+}
+
+/// VMM-owned startup phase timings collected for performance benchmarks.
+#[derive(Debug)]
+pub struct StartupTiming {
+    start: Instant,
+    vm_create_end: Option<Instant>,
+    memory_setup_start: Option<Instant>,
+    memory_setup_end: Option<Instant>,
+    device_setup_end: Option<Instant>,
+    vm_launch_end: Option<Instant>,
+    guest_boot_end: Option<Instant>,
+}
+
+impl StartupTiming {
+    /// Create a timing recorder whose origin is the benchmark start.
+    pub fn new(start: Instant) -> Self {
+        Self {
+            start,
+            vm_create_end: None,
+            memory_setup_start: None,
+            memory_setup_end: None,
+            device_setup_end: None,
+            vm_launch_end: None,
+            guest_boot_end: None,
+        }
+    }
+
+    /// Return the elapsed time spent preparing the VM configuration.
+    pub fn vm_create_ms(&self) -> Option<f64> {
+        self.vm_create_end.map(|end| elapsed_ms(self.start, end))
+    }
+
+    /// Return the elapsed time spent setting up guest memory.
+    pub fn memory_setup_ms(&self) -> Option<f64> {
+        Some(elapsed_ms(
+            self.memory_setup_start?,
+            self.memory_setup_end?,
+        ))
+    }
+
+    /// Return the elapsed time spent configuring devices.
+    pub fn device_setup_ms(&self) -> Option<f64> {
+        Some(elapsed_ms(
+            self.memory_setup_end?,
+            self.device_setup_end?,
+        ))
+    }
+
+    /// Return the elapsed time spent launching and resuming the VM.
+    pub fn vm_launch_ms(&self) -> Option<f64> {
+        Some(elapsed_ms(
+            self.device_setup_end?,
+            self.vm_launch_end?,
+        ))
+    }
+
+    /// Return the elapsed time from VM resume until guest agent connection.
+    pub fn guest_boot_ms(&self) -> Option<f64> {
+        Some(elapsed_ms(self.vm_launch_end?, self.guest_boot_end?))
+    }
+
+    pub(crate) fn mark_vm_create_end(&mut self) {
+        self.vm_create_end = Some(Instant::now());
+    }
+
+    pub(crate) fn mark_memory_setup_start(&mut self) {
+        self.memory_setup_start = Some(Instant::now());
+    }
+
+    pub(crate) fn mark_memory_setup_end(&mut self) {
+        self.memory_setup_end = Some(Instant::now());
+    }
+
+    pub(crate) fn mark_device_setup_end(&mut self) {
+        self.device_setup_end = Some(Instant::now());
+    }
+
+    pub(crate) fn mark_vm_launch_end(&mut self) {
+        self.vm_launch_end = Some(Instant::now());
+    }
+
+    /// Mark the guest boot phase complete when the guest agent connects.
+    pub fn mark_guest_boot_end(&mut self) {
+        self.guest_boot_end = Some(Instant::now());
+    }
+}
+
+fn elapsed_ms(start: Instant, end: Instant) -> f64 {
+    end.duration_since(start).as_secs_f64() * 1000.0
 }
 
 /// Trait for VMM-specific contruction and runtime resources
@@ -472,6 +566,7 @@ impl<T: PetriVmmBackend> PetriVmBuilder<T> {
             resources: PetriVmResources {
                 driver: driver.clone(),
                 log_source: params.logger.clone(),
+                startup_timing: None,
             },
 
             guest_quirks,
@@ -494,6 +589,7 @@ impl<T: PetriVmmBackend> PetriVmBuilder<T> {
             vhost_vsock_guest_cid: None,
             no_vmbus: false,
             no_hv: false,
+            startup_timing: None,
         }
         .add_petri_scsi_controllers()
         .add_guest_crash_disk(params.post_test_hooks))
@@ -553,6 +649,7 @@ impl<T: PetriVmmBackend> PetriVmBuilder<T> {
             resources: PetriVmResources {
                 driver: driver.clone(),
                 log_source: params.logger.clone(),
+                startup_timing: None,
             },
 
             guest_quirks,
@@ -575,6 +672,7 @@ impl<T: PetriVmmBackend> PetriVmBuilder<T> {
             vhost_vsock_guest_cid: None,
             no_vmbus: false,
             no_hv: false,
+            startup_timing: None,
         })
     }
 
@@ -1072,7 +1170,7 @@ impl<T: PetriVmmBackend> PetriVmBuilder<T> {
     /// event (if configured). Does not configure and start pipette. Should
     /// only be used for testing platforms that pipette does not support.
     pub async fn run_without_agent(self) -> anyhow::Result<PetriVm<T>> {
-        self.run_core().await
+        self.run_core().await.map(|(vm, _)| vm)
     }
 
     /// Build and run the VM, then wait for the VM to emit the expected boot
@@ -1080,12 +1178,22 @@ impl<T: PetriVmmBackend> PetriVmBuilder<T> {
     pub async fn run(self) -> anyhow::Result<(PetriVm<T>, PipetteClient)> {
         assert!(self.using_vtl0_pipette());
 
-        let mut vm = self.run_core().await?;
+        let (mut vm, startup_timing) = self.run_core().await?;
         let client = vm.wait_for_agent().await?;
+        if let Some(startup_timing) = startup_timing {
+            startup_timing.lock().unwrap().mark_guest_boot_end();
+        }
         Ok((vm, client))
     }
 
-    async fn run_core(mut self) -> anyhow::Result<PetriVm<T>> {
+    /// Enable collection of VMM-owned startup phase timings.
+    pub fn with_startup_timing(mut self, timing: Arc<Mutex<StartupTiming>>) -> Self {
+        self.startup_timing = Some(timing);
+        self
+    }
+
+    async fn run_core(mut self) -> anyhow::Result<(PetriVm<T>, Option<Arc<Mutex<StartupTiming>>>)> {
+        self.resources.startup_timing = self.startup_timing.clone();
         // Add the boot disk now to allow the test to modify the boot type
         // Add the agent disks now to allow the test to add custom files
         self = self.add_boot_disk().add_agent_disks();
@@ -1093,14 +1201,14 @@ impl<T: PetriVmmBackend> PetriVmBuilder<T> {
         // Auto-prepare the initrd with pipette injected if needed.
         // This centralizes the injection logic so backends only ever
         // receive a prebuilt_initrd path.
-        let _prepared_initrd_guard =
-            if self.uses_pipette_as_init() && self.prebuilt_initrd.is_none() {
-                let tmp = self.prepare_initrd()?;
-                self.prebuilt_initrd = Some(tmp.to_path_buf());
-                Some(tmp)
-            } else {
-                None
-            };
+        let _prepared_initrd_guard;
+        if self.uses_pipette_as_init() && self.prebuilt_initrd.is_none() {
+            let tmp = self.prepare_initrd()?;
+            self.prebuilt_initrd = Some(tmp.to_path_buf());
+            _prepared_initrd_guard = Some(tmp);
+        } else {
+            _prepared_initrd_guard = None;
+        }
 
         tracing::debug!(builder = ?self);
 
@@ -1141,7 +1249,7 @@ impl<T: PetriVmmBackend> PetriVmBuilder<T> {
 
         vm.wait_for_expected_boot_event().await?;
 
-        Ok(vm)
+        Ok((vm, self.startup_timing))
     }
 
     fn expect_reset(&self) -> bool {

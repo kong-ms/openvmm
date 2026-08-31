@@ -135,7 +135,11 @@ impl PetriVmConfigOpenVmm {
 
         tracing::debug!(?firmware, ?arch, "Petri VM firmware configuration");
 
-        let PetriVmResources { driver, log_source } = resources;
+        let PetriVmResources {
+            driver,
+            log_source,
+            startup_timing,
+        } = resources;
         #[cfg(target_os = "linux")]
         let vhost_vsock_guest_cid = properties.vhost_vsock_guest_cid;
         #[cfg(not(target_os = "linux"))]
@@ -467,6 +471,10 @@ impl PetriVmConfigOpenVmm {
         // methods which force shared memory can fail on an explicit conflict.
         let requested_private_memory = memory.private_memory;
 
+        if let Some(timing) = &startup_timing {
+            timing.lock().unwrap().mark_vm_create_end();
+            timing.lock().unwrap().mark_memory_setup_start();
+        }
         let numa = {
             let MemoryConfig {
                 startup_bytes,
@@ -541,6 +549,9 @@ impl PetriVmConfigOpenVmm {
                 }
             }
         };
+        if let Some(timing) = &startup_timing {
+            timing.lock().unwrap().mark_memory_setup_end();
+        }
 
         let processor_topology = {
             let ProcessorTopology {
@@ -760,6 +771,7 @@ impl PetriVmConfigOpenVmm {
             openvmm_log_file: log_source.log_file("openvmm")?,
 
             memory_backing_file: None,
+            startup_timing: startup_timing.clone(),
             requested_private_memory,
 
             ged,

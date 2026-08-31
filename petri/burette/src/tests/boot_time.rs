@@ -11,6 +11,8 @@
 use crate::report::MetricResult;
 use anyhow::Context as _;
 use petri_artifacts_common::tags::MachineArch;
+use std::sync::Arc;
+use std::sync::Mutex;
 
 /// Boot time configuration profile.
 ///
@@ -222,6 +224,8 @@ impl crate::harness::ColdPerfTest for BootTimeTest {
             post_test_hooks: &mut post_test_hooks,
         };
 
+        let start = std::time::Instant::now();
+        let startup_timing = Arc::new(Mutex::new(petri::StartupTiming::new(start)));
         let mut config = self
             .profile
             .create_builder(params, artifacts, driver)?
@@ -233,16 +237,33 @@ impl crate::harness::ColdPerfTest for BootTimeTest {
                 startup_bytes: self.mem_mb * 1024 * 1024,
                 private_memory: Some(self.profile.uses_private_memory()),
                 ..Default::default()
-            });
+            })
+            .with_startup_timing(startup_timing.clone());
 
         if self.profile.uses_minimal_builder() {
             config = config.with_prebuilt_initrd(self.initrd.to_path_buf());
         }
 
-        // Measure: start timing right before run(), stop when pipette connects.
-        let start = std::time::Instant::now();
+        // Measure: stop when pipette connects.
         let (vm, agent) = config.run().await.context("failed to boot VM")?;
         let elapsed = start.elapsed();
+
+        let timing = startup_timing.lock().unwrap();
+        let phase_metrics = [
+            ("vm_create_ms", timing.vm_create_ms()),
+            ("memory_setup_ms", timing.memory_setup_ms()),
+            ("device_setup_ms", timing.device_setup_ms()),
+            ("vm_launch_ms", timing.vm_launch_ms()),
+            ("guest_boot_ms", timing.guest_boot_ms()),
+        ];
+        let mut metrics = Vec::with_capacity(phase_metrics.len() + 1);
+        for (name, value) in phase_metrics {
+            metrics.push(MetricResult {
+                name: name.to_string(),
+                unit: "ms".to_string(),
+                value: value.context("startup timing milestone was not recorded")?,
+            });
+        }
 
         let boot_time_ms = elapsed.as_secs_f64() * 1000.0;
         tracing::info!(boot_time_ms, "boot complete");
@@ -257,11 +278,12 @@ impl crate::harness::ColdPerfTest for BootTimeTest {
             .await
             .context("failed to tear down VM")?;
 
-        Ok(vec![MetricResult {
+        metrics.push(MetricResult {
             name: "boot_time_ms".to_string(),
             unit: "ms".to_string(),
             value: boot_time_ms,
-        }])
+        });
+        Ok(metrics)
     }
 }
 

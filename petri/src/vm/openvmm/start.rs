@@ -46,6 +46,7 @@ impl PetriVmConfigOpenVmm {
             framebuffer_view,
 
             pending_iommu,
+            startup_timing,
         } = self;
 
         // Resolve deferred IOMMU assignments.
@@ -180,6 +181,9 @@ impl PetriVmConfigOpenVmm {
 
         tracing::info!("Resuming VM");
         vm.resume().await?;
+        if let Some(timing) = &startup_timing {
+            timing.lock().unwrap().mark_vm_launch_end();
+        }
 
         // Run basic save/restore test if it is supported
         if supports_save_restore && !is_minimal {
