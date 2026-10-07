@@ -146,7 +146,9 @@ struct State {
 }
 
 // A normal FIFO has only 16 bytes, but we get greater batching with these values.
-const TX_OUTPUT_MAX: usize = 256;
+// Large enough to absorb verbose boot bursts while remaining bounded if the
+// backend stops making progress.
+const TX_OUTPUT_MAX: usize = 64 * 1024;
 const RX_BUFFER_MAX: usize = 256;
 
 /// An error returned by [`Serial16550::new`].
