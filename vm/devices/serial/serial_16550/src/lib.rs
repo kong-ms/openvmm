@@ -627,8 +627,10 @@ impl State {
         self.tx_fifo.is_empty()
     }
 
+    /// The backend queue is downstream of the emulated transmitter and does
+    /// not delay guest-visible transmission completion.
     fn is_transmitter_empty(&self) -> bool {
-        self.tx_fifo.is_empty() && self.tx_output.is_empty()
+        self.tx_fifo.is_empty()
     }
 
     /// Returns whether it is time to poll the backend device for more data.
@@ -1411,7 +1413,7 @@ mod tests {
     }
 
     #[async_test]
-    async fn tx_reports_holding_register_empty_while_backend_is_stalled() {
+    async fn tx_reports_transmitter_empty_while_backend_is_stalled() {
         let (backend, handle) = MockBackend::new();
         handle.set_write_stalled(true);
         let mut serial = new_serial(backend);
@@ -1421,7 +1423,7 @@ mod tests {
 
         let lsr = read_reg(&mut serial, Register::LSR);
         assert_ne!(lsr & 0x20, 0, "THR should be empty");
-        assert_eq!(lsr & 0x40, 0, "transmitter should still contain output");
+        assert_ne!(lsr & 0x40, 0, "transmitter should be empty");
         assert!(serial.state.tx_fifo.is_empty());
         assert_eq!(serial.state.tx_output, [b'A']);
     }
@@ -1441,7 +1443,11 @@ mod tests {
 
         write_reg(&mut serial, Register::THR, b'Z');
         let lsr = read_reg(&mut serial, Register::LSR);
-        assert_eq!(lsr & 0x20, 0, "THR should apply bounded backpressure");
+        assert_eq!(
+            lsr & 0x60,
+            0,
+            "transmitter should apply bounded backpressure"
+        );
         assert_eq!(serial.state.tx_fifo, [b'Z']);
 
         // A guest that ignores THRE cannot grow the queues without bound.
@@ -1481,8 +1487,11 @@ mod tests {
         assert_eq!(serial.state.tx_output.len(), TX_OUTPUT_MAX);
 
         let lsr = read_reg(&mut serial, Register::LSR);
-        assert_ne!(lsr & 0x20, 0, "cleared THR FIFO should be empty");
-        assert_eq!(lsr & 0x40, 0, "backend output should remain pending");
+        assert_eq!(
+            lsr & 0x60,
+            0x60,
+            "cleared transmitter should be empty despite pending backend output"
+        );
     }
 
     #[async_test]
@@ -1590,6 +1599,11 @@ mod tests {
         restored.restore(saved).unwrap();
         assert_eq!(restored.state.tx_output, output);
         assert_eq!(restored.state.tx_fifo, [b'Z']);
+        assert_eq!(
+            read_reg(&mut restored, Register::LSR) & 0x60,
+            0,
+            "restored transmitter backpressure should match the saved state"
+        );
 
         restored_handle.set_write_stalled(false);
         poll_serial(&mut restored).await;
