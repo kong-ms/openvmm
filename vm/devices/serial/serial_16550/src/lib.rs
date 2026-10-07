@@ -138,13 +138,15 @@ struct State {
     thr_empty_acknowledged: bool,
     rx_overrun: bool,
     #[inspect(with = "VecDeque::len")]
-    tx_buffer: VecDeque<u8>,
+    tx_fifo: VecDeque<u8>,
+    #[inspect(with = "VecDeque::len")]
+    tx_output: VecDeque<u8>,
     #[inspect(with = "VecDeque::len")]
     rx_buffer: VecDeque<u8>,
 }
 
 // A normal FIFO has only 16 bytes, but we get greater batching with these values.
-const TX_BUFFER_MAX: usize = 256;
+const TX_OUTPUT_MAX: usize = 256;
 const RX_BUFFER_MAX: usize = 256;
 
 /// An error returned by [`Serial16550::new`].
@@ -223,7 +225,7 @@ impl Serial16550 {
     /// Synchronize interrupt and waker state with device state.
     fn sync(&mut self) {
         // Wake to poll if there are any bytes to write.
-        if !self.state.tx_buffer.is_empty() {
+        if !self.state.tx_output.is_empty() {
             if let Some(waker) = self.tx_waker.take() {
                 waker.wake();
             }
@@ -245,19 +247,24 @@ impl Serial16550 {
     }
 
     fn poll_tx(&mut self, cx: &mut Context<'_>) -> Poll<()> {
-        while !self.state.tx_buffer.is_empty() {
+        self.state.pump_tx();
+        while !self.state.tx_output.is_empty() {
             if !self.state.msr.dcd() {
-                // The backend is disconnected, so drop everything in the FIFO.
-                self.stats.tx_dropped.add(self.state.tx_buffer.len() as u64);
-                self.state.tx_buffer.clear();
+                // The backend is disconnected, so drop all pending output.
+                self.stats
+                    .tx_dropped
+                    .add(self.state.pending_tx_len() as u64);
+                self.state.tx_fifo.clear();
+                self.state.tx_output.clear();
                 break;
             }
-            let (buf, _) = self.state.tx_buffer.as_slices();
+            let (buf, _) = self.state.tx_output.as_slices();
             match ready!(Pin::new(&mut self.io).poll_write(cx, buf)) {
                 Ok(n) => {
                     assert_ne!(n, 0);
-                    self.state.tx_buffer.drain(..n);
+                    self.state.tx_output.drain(..n);
                     self.stats.tx_bytes.add(n as u64);
+                    self.state.pump_tx();
                 }
                 Err(err) if err.kind() == ErrorKind::BrokenPipe => {
                     tracing::info!(
@@ -274,7 +281,8 @@ impl Serial16550 {
                         "serial write failed, dropping data"
                     );
                     self.stats.tx_dropped.add(buf.len() as u64);
-                    self.state.tx_buffer.drain(..buf.len());
+                    self.state.tx_output.drain(..buf.len());
+                    self.state.pump_tx();
                 }
             }
         }
@@ -551,7 +559,8 @@ impl State {
             scratch: 0xff,
             thr_empty_acknowledged: false,
             rx_overrun: false,
-            tx_buffer: VecDeque::new(),
+            tx_fifo: VecDeque::new(),
+            tx_output: VecDeque::new(),
             rx_buffer: VecDeque::new(),
             fcr: FifoControlRegister::new(),
         };
@@ -603,41 +612,23 @@ impl State {
         }
     }
 
+    /// Moves bytes accepted by the emulated UART into the bounded backend queue.
+    fn pump_tx(&mut self) {
+        let available = TX_OUTPUT_MAX.saturating_sub(self.tx_output.len());
+        let count = self.tx_fifo.len().min(available);
+        self.tx_output.extend(self.tx_fifo.drain(..count));
+    }
+
+    fn pending_tx_len(&self) -> usize {
+        self.tx_fifo.len() + self.tx_output.len()
+    }
+
     fn is_thr_empty(&self) -> bool {
-        // THR is empty when our buffer is empty. Note that this can cause a
-        // guest to stall if the backend is not emptying its buffers fast enough
-        // (or even stalls indefinitely). This isn't usually a problem, e.g. for
-        // logging or interactive use, but it might cause problems with some
-        // serial protocols or operating systems that expect the FIFO to drain
-        // at the configured baud rate.
-        //
-        // A key advantage of this approach is that it provides backpressure to
-        // the guest, ensuring that the guest won't send faster than the backend
-        // can receive. It also provides a way for a guest to ensure that all
-        // data is flushed before halting the VM.
-        //
-        // There are other approaches, each with different downsides:
-        //
-        // 1. Always report THR empty. This is simple and eliminates any
-        //    stalling, but it also eliminates the backpressure and flush
-        //    advantages.
-        //
-        // 2. Report THR empty after some timeout, but don't drop data unless
-        //    the guest fills up the FIFO. This probabilistically provides some
-        //    degree of backpressure and flushing without stalling the guest
-        //    indefinitely.
-        //
-        // 3. Do either of these, but also add support for auto-flow control, so
-        //    that the guest can opt into only draining the (visible) FIFO when
-        //    the receiver is ready. This is perfect--it provides backpressure
-        //    and flushing, and the guest knows and understands it is happening
-        //    so it won't misbehave--but it requires guest opt in, and Linux, at
-        //    least, will only opt in if the tty is configured to use the
-        //    feature (hardware flow control). Typical configurations will not
-        //    do this.
-        //
-        // For now, follow the behavior of Hyper-V and just stall the guest.
-        self.tx_buffer.is_empty()
+        self.tx_fifo.is_empty()
+    }
+
+    fn is_transmitter_empty(&self) -> bool {
+        self.tx_fifo.is_empty() && self.tx_output.is_empty()
     }
 
     /// Returns whether it is time to poll the backend device for more data.
@@ -776,7 +767,7 @@ impl State {
             .with_framing_error(false)
             .with_break_signal_received(false)
             .with_thr_empty(self.is_thr_empty())
-            .with_thr_and_tsr_empty(self.is_thr_empty())
+            .with_thr_and_tsr_empty(self.is_transmitter_empty())
             .with_fifo_data_error(false);
         self.rx_overrun = false;
         lsr.into()
@@ -798,16 +789,16 @@ impl State {
             }
             self.rx_buffer.push_back(data);
         } else {
-            if self.tx_buffer.len() >= TX_BUFFER_MAX {
+            let fifo_size = self.fifo_size();
+            if self.tx_fifo.len() >= fifo_size {
                 // The FIFO is full. Real hardware drops the newest byte in the
                 // FIFO, not the oldest one.
                 tracing::debug!("tx fifo overrun, dropping output data");
-                stats
-                    .tx_dropped
-                    .add((self.tx_buffer.len() - (TX_BUFFER_MAX - 1)) as u64);
-                self.tx_buffer.truncate(TX_BUFFER_MAX - 1);
+                stats.tx_dropped.add(1);
+            } else {
+                self.tx_fifo.push_back(data);
             }
-            self.tx_buffer.push_back(data);
+            self.pump_tx();
         }
     }
 
@@ -833,8 +824,8 @@ impl State {
             }
             if fcr.clear_tx_fifo() {
                 tracing::trace!("clearing tx fifo");
-                stats.tx_dropped.add(self.tx_buffer.len() as u64);
-                self.tx_buffer.clear();
+                stats.tx_dropped.add(self.tx_fifo.len() as u64);
+                self.tx_fifo.clear();
             }
             self.fcr = fcr.with_clear_rx_fifo(false).with_clear_tx_fifo(false);
         } else {
@@ -855,7 +846,8 @@ impl State {
             scratch,
             thr_empty_acknowledged,
             rx_overrun,
-            tx_buffer,
+            tx_fifo,
+            tx_output,
             rx_buffer,
         } = Self::new(false);
 
@@ -872,7 +864,8 @@ impl State {
         let _ = dll;
         let _ = dlm;
         let _ = scratch;
-        let _ = tx_buffer;
+        let _ = tx_fifo;
+        let _ = tx_output;
         let _ = rx_buffer;
     }
 }
@@ -914,6 +907,8 @@ impl MmioIntercept for Serial16550 {
 }
 
 mod save_restore {
+    use crate::FIFO_SIZE;
+    use crate::FifoControlRegister;
     use crate::Serial16550;
     use crate::State;
     use vmcore::save_restore::RestoreError;
@@ -951,6 +946,27 @@ mod save_restore {
             pub(super) tx_buffer: Vec<u8>,
             #[mesh(12)]
             pub(super) rx_buffer: Vec<u8>,
+            #[mesh(13)]
+            pub(super) tx_fifo_len: u32,
+        }
+    }
+
+    #[derive(Debug, thiserror::Error)]
+    enum SerialRestoreError {
+        #[error(
+            "invalid transmit FIFO length {fifo_len} for {pending_len} pending bytes and FIFO capacity {fifo_capacity}"
+        )]
+        InvalidTxFifoLength {
+            fifo_len: usize,
+            pending_len: usize,
+            fifo_capacity: usize,
+        },
+    }
+
+    #[cfg(test)]
+    impl state::SavedState {
+        pub(super) fn pending_tx(&self) -> (&[u8], u32) {
+            (&self.tx_buffer, self.tx_fifo_len)
         }
     }
 
@@ -969,9 +985,13 @@ mod save_restore {
                 scratch,
                 thr_empty_acknowledged,
                 rx_overrun,
-                tx_buffer,
+                tx_fifo,
+                tx_output,
                 rx_buffer,
             } = &self.state;
+            let mut tx_buffer = Vec::with_capacity(tx_output.len() + tx_fifo.len());
+            tx_buffer.extend(tx_output);
+            tx_buffer.extend(tx_fifo);
             Ok(state::SavedState {
                 ier: (*ier).into(),
                 lcr: (*lcr).into(),
@@ -983,8 +1003,11 @@ mod save_restore {
                 scratch: *scratch,
                 thr_empty_acknowledged: *thr_empty_acknowledged,
                 rx_overrun: *rx_overrun,
-                tx_buffer: tx_buffer.clone().into(),
+                // Keep the complete ordered stream in the legacy field so an
+                // older destination can restore it without dropping FIFO bytes.
+                tx_buffer,
                 rx_buffer: rx_buffer.clone().into(),
+                tx_fifo_len: tx_fifo.len() as u32,
             })
         }
 
@@ -1000,23 +1023,40 @@ mod save_restore {
                 scratch,
                 thr_empty_acknowledged,
                 rx_overrun,
-                tx_buffer,
+                mut tx_buffer,
                 rx_buffer,
+                tx_fifo_len,
             } = state;
+            let fcr = FifoControlRegister::from(fcr);
+            let fifo_capacity = if fcr.enable_fifos() { FIFO_SIZE } else { 1 };
+            let tx_fifo_len = tx_fifo_len as usize;
+            if tx_fifo_len > fifo_capacity || tx_fifo_len > tx_buffer.len() {
+                return Err(RestoreError::InvalidSavedState(
+                    SerialRestoreError::InvalidTxFifoLength {
+                        fifo_len: tx_fifo_len,
+                        pending_len: tx_buffer.len(),
+                        fifo_capacity,
+                    }
+                    .into(),
+                ));
+            }
+            let tx_fifo = tx_buffer.split_off(tx_buffer.len() - tx_fifo_len);
             self.state = State {
                 ier: ier.into(),
                 lcr: lcr.into(),
                 mcr: mcr.into(),
                 msr: msr.into(),
-                fcr: fcr.into(),
+                fcr,
                 dll,
                 dlm,
                 scratch,
                 thr_empty_acknowledged,
                 rx_overrun,
-                tx_buffer: tx_buffer.into(),
+                tx_fifo: tx_fifo.into(),
+                tx_output: tx_buffer.into(),
                 rx_buffer: rx_buffer.into(),
             };
+            self.state.pump_tx();
             if self.io.is_connected() {
                 self.state.connect();
             } else {
@@ -1057,6 +1097,7 @@ mod tests {
         rx: VecDeque<u8>,
         written: Vec<u8>,
         write_stalled: bool,
+        max_write_len: Option<usize>,
         read_waker: Option<Waker>,
         write_waker: Option<Waker>,
         wait_waker: Option<Waker>,
@@ -1068,6 +1109,7 @@ mod tests {
                 rx: VecDeque::new(),
                 written: Vec::new(),
                 write_stalled: false,
+                max_write_len: None,
                 read_waker: None,
                 write_waker: None,
                 wait_waker: None,
@@ -1136,11 +1178,14 @@ mod tests {
                 return Poll::Pending;
             }
 
-            state.written.extend_from_slice(buf);
+            let n = state
+                .max_write_len
+                .map_or(buf.len(), |len| len.min(buf.len()));
+            state.written.extend_from_slice(&buf[..n]);
             if let Some(waker) = state.wait_waker.take() {
                 waker.wake();
             }
-            Poll::Ready(Ok(buf.len()))
+            Poll::Ready(Ok(n))
         }
 
         fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
@@ -1172,6 +1217,10 @@ mod tests {
             }
         }
 
+        fn set_max_write_len(&self, max_write_len: Option<usize>) {
+            self.state.lock().max_write_len = max_write_len;
+        }
+
         async fn wait_until(&self, mut predicate: impl FnMut(&MockState) -> bool) {
             poll_fn(|cx| {
                 let mut state = self.state.lock();
@@ -1193,6 +1242,19 @@ mod tests {
             1,
             LineInterrupt::detached(),
             Box::new(DebuggerRelay::new(driver, "com1", Box::new(backend))),
+            false,
+            None,
+        )
+        .unwrap()
+    }
+
+    fn new_serial(backend: impl SerialIo + 'static) -> Serial16550 {
+        Serial16550::new(
+            "com1".to_string(),
+            MmioOrIoPort::IoPort(0x3f8),
+            1,
+            LineInterrupt::detached(),
+            Box::new(backend),
             false,
             None,
         )
@@ -1346,6 +1408,209 @@ mod tests {
                 "reads must never be deferred without debugger mode"
             );
         }
+    }
+
+    #[async_test]
+    async fn tx_reports_holding_register_empty_while_backend_is_stalled() {
+        let (backend, handle) = MockBackend::new();
+        handle.set_write_stalled(true);
+        let mut serial = new_serial(backend);
+
+        write_reg(&mut serial, Register::THR, b'A');
+        poll_serial(&mut serial).await;
+
+        let lsr = read_reg(&mut serial, Register::LSR);
+        assert_ne!(lsr & 0x20, 0, "THR should be empty");
+        assert_eq!(lsr & 0x40, 0, "transmitter should still contain output");
+        assert!(serial.state.tx_fifo.is_empty());
+        assert_eq!(serial.state.tx_output, [b'A']);
+    }
+
+    #[async_test]
+    async fn tx_applies_backpressure_when_bounded_output_fills() {
+        let (backend, handle) = MockBackend::new();
+        handle.set_write_stalled(true);
+        let mut serial = new_serial(backend);
+        let output: Vec<_> = (0..TX_OUTPUT_MAX).map(|i| i as u8).collect();
+
+        for &byte in &output {
+            write_reg(&mut serial, Register::THR, byte);
+        }
+        assert_eq!(serial.state.tx_output.len(), TX_OUTPUT_MAX);
+        assert!(serial.state.tx_fifo.is_empty());
+
+        write_reg(&mut serial, Register::THR, b'Z');
+        let lsr = read_reg(&mut serial, Register::LSR);
+        assert_eq!(lsr & 0x20, 0, "THR should apply bounded backpressure");
+        assert_eq!(serial.state.tx_fifo, [b'Z']);
+
+        // A guest that ignores THRE cannot grow the queues without bound.
+        write_reg(&mut serial, Register::THR, b'X');
+        assert_eq!(serial.state.pending_tx_len(), TX_OUTPUT_MAX + 1);
+
+        handle.set_write_stalled(false);
+        poll_serial(&mut serial).await;
+        let mut expected = output;
+        expected.push(b'Z');
+        handle
+            .wait_until(|state| state.written.len() == expected.len())
+            .await;
+        assert_eq!(handle.state.lock().written, expected);
+
+        let lsr = read_reg(&mut serial, Register::LSR);
+        assert_eq!(lsr & 0x60, 0x60, "transmitter should be fully empty");
+    }
+
+    #[async_test]
+    async fn tx_fifo_clear_does_not_recall_backend_output() {
+        let (backend, handle) = MockBackend::new();
+        handle.set_write_stalled(true);
+        let mut serial = new_serial(backend);
+
+        for byte in 0..TX_OUTPUT_MAX {
+            write_reg(&mut serial, Register::THR, byte as u8);
+        }
+        write_reg(&mut serial, Register::FCR, 0x01);
+        for byte in 0..FIFO_SIZE {
+            write_reg(&mut serial, Register::THR, (byte + 1) as u8);
+        }
+        assert_eq!(serial.state.tx_fifo.len(), FIFO_SIZE);
+
+        write_reg(&mut serial, Register::FCR, 0x05);
+        assert!(serial.state.tx_fifo.is_empty());
+        assert_eq!(serial.state.tx_output.len(), TX_OUTPUT_MAX);
+
+        let lsr = read_reg(&mut serial, Register::LSR);
+        assert_ne!(lsr & 0x20, 0, "cleared THR FIFO should be empty");
+        assert_eq!(lsr & 0x40, 0, "backend output should remain pending");
+    }
+
+    #[async_test]
+    async fn tx_preserves_order_across_partial_backend_writes() {
+        let (backend, handle) = MockBackend::new();
+        handle.set_max_write_len(Some(3));
+        let mut serial = new_serial(backend);
+        let output = b"partial writes must preserve byte order";
+
+        for &byte in output {
+            write_reg(&mut serial, Register::THR, byte);
+        }
+        poll_serial(&mut serial).await;
+
+        assert_eq!(handle.state.lock().written, output);
+        assert!(serial.state.is_transmitter_empty());
+    }
+
+    #[async_test]
+    async fn tx_empty_interrupt_reasserts_when_backend_makes_room() {
+        let (backend, handle) = MockBackend::new();
+        handle.set_write_stalled(true);
+        let mut serial = new_serial(backend);
+
+        // Enable THRE interrupts and route them through OUT2.
+        write_reg(&mut serial, Register::IER, 0x02);
+        write_reg(&mut serial, Register::MCR, 0x08);
+        assert_eq!(read_reg(&mut serial, Register::ISR) & 0x0f, 0x02);
+
+        for byte in 0..TX_OUTPUT_MAX {
+            write_reg(&mut serial, Register::THR, byte as u8);
+        }
+        write_reg(&mut serial, Register::THR, b'Z');
+        assert_eq!(
+            read_reg(&mut serial, Register::ISR) & 0x01,
+            0x01,
+            "THR interrupt must not be pending while the FIFO is occupied"
+        );
+
+        handle.set_write_stalled(false);
+        poll_serial(&mut serial).await;
+        assert_eq!(
+            read_reg(&mut serial, Register::ISR) & 0x0f,
+            0x02,
+            "THR interrupt should reassert after the FIFO drains"
+        );
+    }
+
+    #[test]
+    fn tx_empty_interrupt_reasserts_after_accepting_output() {
+        let (backend, handle) = MockBackend::new();
+        handle.set_write_stalled(true);
+        let mut serial = new_serial(backend);
+
+        write_reg(&mut serial, Register::IER, 0x02);
+        assert_eq!(read_reg(&mut serial, Register::ISR) & 0x0f, 0x02);
+
+        write_reg(&mut serial, Register::THR, b'A');
+        assert_eq!(serial.state.tx_output, [b'A']);
+        assert!(serial.state.tx_fifo.is_empty());
+        assert_eq!(
+            read_reg(&mut serial, Register::ISR) & 0x0f,
+            0x02,
+            "moving output out of THR should reassert its empty interrupt"
+        );
+    }
+
+    #[test]
+    fn tx_pump_tolerates_oversized_restored_output() {
+        let (backend, _handle) = MockBackend::new();
+        let mut serial = new_serial(backend);
+        serial
+            .state
+            .tx_output
+            .extend(std::iter::repeat_n(0, TX_OUTPUT_MAX + 1));
+        serial.state.tx_fifo.push_back(b'A');
+
+        serial.state.pump_tx();
+
+        assert_eq!(serial.state.tx_output.len(), TX_OUTPUT_MAX + 1);
+        assert_eq!(serial.state.tx_fifo, [b'A']);
+    }
+
+    #[async_test]
+    async fn tx_save_restore_preserves_both_transmit_stages() {
+        use vmcore::save_restore::SaveRestore;
+
+        let (backend, handle) = MockBackend::new();
+        handle.set_write_stalled(true);
+        let mut serial = new_serial(backend);
+        let output: Vec<_> = (0..TX_OUTPUT_MAX).map(|i| i as u8).collect();
+
+        for &byte in &output {
+            write_reg(&mut serial, Register::THR, byte);
+        }
+        write_reg(&mut serial, Register::THR, b'Z');
+        let saved = serial.save().unwrap();
+        let mut legacy_output = output.clone();
+        legacy_output.push(b'Z');
+        assert_eq!(saved.pending_tx(), (legacy_output.as_slice(), 1));
+
+        let (restored_backend, restored_handle) = MockBackend::new();
+        restored_handle.set_write_stalled(true);
+        let mut restored = new_serial(restored_backend);
+        restored.restore(saved).unwrap();
+        assert_eq!(restored.state.tx_output, output);
+        assert_eq!(restored.state.tx_fifo, [b'Z']);
+
+        restored_handle.set_write_stalled(false);
+        poll_serial(&mut restored).await;
+        let mut expected = output;
+        expected.push(b'Z');
+        assert_eq!(restored_handle.state.lock().written, expected);
+    }
+
+    #[async_test]
+    async fn disconnected_backend_drops_both_transmit_stages() {
+        let mut serial = new_serial(serial_core::disconnected::Disconnected);
+
+        for byte in 0..TX_OUTPUT_MAX {
+            write_reg(&mut serial, Register::THR, byte as u8);
+        }
+        write_reg(&mut serial, Register::THR, b'Z');
+        assert_eq!(serial.state.pending_tx_len(), TX_OUTPUT_MAX + 1);
+
+        poll_serial(&mut serial).await;
+        assert!(serial.state.is_transmitter_empty());
+        assert_eq!(read_reg(&mut serial, Register::LSR) & 0x60, 0x60);
     }
 
     /// Resetting the device must leave the modem lines matching the backend, so
