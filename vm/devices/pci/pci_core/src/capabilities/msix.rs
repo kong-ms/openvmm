@@ -790,6 +790,36 @@ mod tests {
     }
 
     #[async_test]
+    async fn software_delivery_uses_bound_event_without_bypassing_masks(driver: DefaultDriver) {
+        let (msi_conn, _log) = route_conn(Arc::new(driver));
+        let (mut msix, mut cap) = MsixEmulator::new(2, 1, &msi_conn.target());
+        let interrupt = msix.interrupt(0).unwrap();
+        let event = interrupt.event().unwrap().clone();
+        write_cap_u32(&mut cap, 0, 0x80000000);
+        msix.write_u32(0, 0xFEE00000);
+        msix.write_u32(8, 0x42);
+        msix.write_u32(12, 0);
+
+        interrupt.deliver();
+        assert!(event.try_wait());
+
+        msix.write_u32(12, 1);
+        interrupt.deliver();
+        assert!(!event.try_wait());
+        assert_eq!(msix.read_u32(16) & 1, 1);
+        msix.write_u32(12, 0);
+        assert!(event.try_wait(), "unmask delivers the pending interrupt");
+        assert_eq!(msix.read_u32(16) & 1, 0);
+
+        write_cap_u32(&mut cap, 0, 0);
+        interrupt.deliver();
+        assert!(!event.try_wait());
+        assert_eq!(msix.read_u32(16) & 1, 1);
+        write_cap_u32(&mut cap, 0, 0x80000000);
+        assert!(event.try_wait());
+    }
+
+    #[async_test]
     async fn route_binds_on_unmask_without_delivery(driver: DefaultDriver) {
         let (msi_conn, log) = route_conn(Arc::new(driver));
         let (mut msix, mut cap) = MsixEmulator::new(2, 2, &msi_conn.target());

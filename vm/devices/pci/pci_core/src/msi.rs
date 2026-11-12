@@ -286,10 +286,12 @@ impl MsiRoute {
         }));
     }
 
-    /// Delivers an interrupt directly using this route's cached resolution.
+    /// Delivers through the kernel binding, or the cached userspace destination.
     pub fn signal(&self) {
         let mut state = self.cached.state.lock();
-        if let Some(request) = state.request {
+        if state.binding.is_some() {
+            self.event.signal();
+        } else if let Some(request) = state.request {
             self.cached.deliver(&mut state, request);
         } else {
             self.event.signal();
@@ -929,6 +931,45 @@ mod tests {
             self.binds.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Some(Box::new(RecordingBinding))
         }
+    }
+
+    #[async_test]
+    async fn software_signal_uses_binding_and_falls_back_after_invalidation(driver: DefaultDriver) {
+        use std::sync::atomic::Ordering;
+        let router = TransportRouter::new();
+        router.valid.store(true, Ordering::SeqCst);
+        let connection = MsiConnection::new();
+        connection.connect(router.clone());
+        connection.enable_msi_routes(Arc::new(driver));
+        let route = connection.target().new_route().unwrap().unwrap();
+        route.enable(0x1000, 42);
+
+        route.signal();
+        assert!(
+            route.consume_pending(),
+            "the kernel-bound event was signaled"
+        );
+        assert_eq!(router.signals.load(Ordering::SeqCst), 0);
+
+        router.bindable.store(false, Ordering::SeqCst);
+        router.routes.invalidate(None);
+        route.signal();
+        assert!(!route.consume_pending());
+        assert_eq!(router.signals.load(Ordering::SeqCst), 1);
+
+        router.bindable.store(true, Ordering::SeqCst);
+        router.routes.invalidate(None);
+        route.signal();
+        assert!(route.consume_pending());
+        assert_eq!(router.signals.load(Ordering::SeqCst), 1);
+
+        route.disable();
+        route.signal();
+        assert!(
+            route.consume_pending(),
+            "disabled routes retain pending state"
+        );
+        assert_eq!(router.signals.load(Ordering::SeqCst), 1);
     }
 
     #[async_test]

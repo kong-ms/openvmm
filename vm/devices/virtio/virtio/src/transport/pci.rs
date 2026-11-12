@@ -151,6 +151,8 @@ impl TransportOps for PciTransport {
         match &self.interrupt_kind {
             InterruptKind::Msix(msix) => {
                 if let Some(interrupt) = msix.interrupt(msix_vector) {
+                    // Prepare the irqfd route, but keep delivery behind MSI-X masking.
+                    interrupt.event();
                     interrupt
                 } else {
                     tracelimit::warn_ratelimited!(msix_vector, "invalid MSIx vector specified");
