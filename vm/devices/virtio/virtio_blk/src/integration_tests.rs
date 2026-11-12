@@ -573,6 +573,7 @@ async fn multiqueue_threads_complete_independently_and_restart(driver: DefaultDr
             queue_count: 2,
             io_depth: 1,
             dedicated_threads: true,
+            io_threads: None,
         },
     )
     .unwrap();
@@ -625,6 +626,72 @@ async fn multiqueue_threads_complete_independently_and_restart(driver: DefaultDr
     second.mem.read_at(data, &mut actual).unwrap();
     assert_eq!(actual, [0xa5; 512]);
     first.device.stop_queue(1).await.unwrap();
+}
+
+#[async_test]
+async fn multiqueue_shares_dedicated_threads_round_robin(driver: DefaultDriver) {
+    let (started, started_recv) = async_channel::unbounded();
+    let disk = HookDisk::new(64 * 1024, 512)
+        .with_async_hook(move |_| {
+            let started = started.clone();
+            async move {
+                started.send(std::thread::current().id()).await.unwrap();
+                Ok(())
+            }
+        })
+        .into_disk();
+    let source = VmTaskDriverSource::new(ThreadDriverBackend::new(driver.clone()));
+    let mut device = VirtioBlkDevice::with_options(
+        &source,
+        disk.clone(),
+        false,
+        None,
+        VirtioBlkOptions {
+            queue_count: 4,
+            io_depth: 1,
+            dedicated_threads: true,
+            io_threads: Some(2),
+        },
+    )
+    .unwrap();
+    let features = VirtioDeviceFeatures::new().with_device_specific_low(VIRTIO_BLK_F_MQ);
+    let mut queues: Vec<_> = (0..4)
+        .map(|_| TestHarness::new(&driver, disk.clone(), false))
+        .collect();
+    let mut threads = Vec::new();
+    for (index, queue) in queues.iter_mut().enumerate() {
+        device
+            .start_queue(
+                u16::try_from(index).unwrap(),
+                queue.resources(),
+                &features,
+                None,
+            )
+            .await
+            .unwrap();
+        queue.post_read_request(0, 0, 512);
+        assert_eq!(queue.wait_for_used().await, (0, 513));
+        threads.push(started_recv.recv().await.unwrap());
+    }
+    assert_eq!(threads[0], threads[2]);
+    assert_eq!(threads[1], threads[3]);
+    assert_ne!(threads[0], threads[1]);
+    assert!(threads.iter().all(|id| *id != std::thread::current().id()));
+
+    let saved = device.stop_queue(0).await.unwrap();
+    queues[2].post_read_request(2, 0, 512);
+    assert_eq!(queues[2].wait_for_used().await, (2, 513));
+    assert_eq!(started_recv.recv().await.unwrap(), threads[2]);
+    device
+        .start_queue(0, queues[0].resources(), &features, Some(saved))
+        .await
+        .unwrap();
+    queues[0].post_read_request(2, 0, 512);
+    assert_eq!(queues[0].wait_for_used().await, (2, 513));
+    assert_eq!(started_recv.recv().await.unwrap(), threads[0]);
+    for index in 0..4 {
+        device.stop_queue(index).await.unwrap();
+    }
 }
 
 #[async_test]
@@ -686,6 +753,24 @@ async fn multiqueue_requires_negotiation_and_valid_queue_indices(driver: Default
                     queue_count,
                     io_depth,
                     dedicated_threads: false,
+                    io_threads: None,
+                },
+            )
+            .is_err()
+        );
+    }
+    for (dedicated_threads, io_threads) in [(false, 1), (true, 0), (true, 3)] {
+        assert!(
+            VirtioBlkDevice::with_options(
+                &source,
+                disk.clone(),
+                false,
+                None,
+                VirtioBlkOptions {
+                    queue_count: 2,
+                    dedicated_threads,
+                    io_threads: Some(io_threads),
+                    ..Default::default()
                 },
             )
             .is_err()

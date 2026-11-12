@@ -579,11 +579,17 @@ options:
     #[clap(long, default_value_t = 64, value_parser = clap::value_parser!(u16).range(1..))]
     pub virtio_blk_io_depth: u16,
 
-    /// Use a separate task driver per native virtio-blk queue.
+    /// Use dedicated task drivers for native virtio-blk queues.
     ///
-    /// The standalone VMM thread backend gives each queue its own I/O thread.
+    /// Defaults to one I/O thread per queue in the standalone VMM.
     #[clap(long)]
     pub virtio_blk_dedicated_threads: bool,
+
+    /// Dedicated I/O threads per native virtio-blk disk (1 to its queue count).
+    ///
+    /// Queues share these threads round-robin.
+    #[clap(long, requires = "virtio_blk_dedicated_threads", value_parser = clap::value_parser!(u16).range(1..=256))]
+    pub virtio_blk_io_threads: Option<u16>,
 
     /// Attach a vhost-user device via a Unix socket.
     ///
@@ -4223,6 +4229,29 @@ mod tests {
                 .collect::<Vec<_>>(),
             [Some(4), Some(1), None]
         );
+    }
+
+    #[test]
+    fn test_virtio_blk_io_thread_options() {
+        let opt = Options::try_parse_from([
+            "openvmm",
+            "--virtio-blk-queues=4",
+            "--virtio-blk-dedicated-threads",
+            "--virtio-blk-io-threads=2",
+        ])
+        .unwrap();
+        assert_eq!(opt.virtio_blk_io_threads, Some(2));
+        assert!(Options::try_parse_from(["openvmm", "--virtio-blk-io-threads=2"]).is_err());
+        for count in ["0", "257", "-1"] {
+            assert!(
+                Options::try_parse_from([
+                    "openvmm",
+                    "--virtio-blk-dedicated-threads",
+                    &format!("--virtio-blk-io-threads={count}"),
+                ])
+                .is_err()
+            );
+        }
     }
 
     #[test]

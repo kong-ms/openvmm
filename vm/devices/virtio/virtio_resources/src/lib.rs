@@ -147,6 +147,7 @@ pub mod blk {
         pub queue_count: u16,
         pub io_depth: u16,
         pub dedicated_threads: bool,
+        pub io_threads: Option<u16>,
     }
 
     impl Default for VirtioBlkOptions {
@@ -155,6 +156,7 @@ pub mod blk {
                 queue_count: 1,
                 io_depth: 64,
                 dedicated_threads: false,
+                io_threads: None,
             }
         }
     }

@@ -762,6 +762,7 @@ async fn vm_config_from_command_line(
                         queue_count: num_queues.unwrap_or(opt.virtio_blk_queues),
                         io_depth: opt.virtio_blk_io_depth,
                         dedicated_threads: opt.virtio_blk_dedicated_threads,
+                        io_threads: opt.virtio_blk_io_threads,
                     },
                 },
                 kind,
