@@ -530,16 +530,25 @@ Native virtio-blk concurrency is opt-in. Each disk accepts `num_queues=<COUNT>`
 to select 1-256 request queues. When omitted, `--virtio-blk-queues <COUNT>`
 supplies the default (1). `--virtio-blk-io-depth <COUNT>` limits in-flight
 requests per queue (default 64). Additional queues require the guest to negotiate
-`VIRTIO_BLK_F_MQ`; guests without it use queue 0. Queues use the default shared
+`VIRTIO_BLK_F_MQ`; guests without it use queue 0.
+`--virtio-blk-dedicated-threads` uses dedicated task drivers; the standalone
+thread backend defaults to an independent I/O thread per queue.
+`--virtio-blk-io-threads <COUNT>` limits those threads per disk, with queues
+assigned round-robin. It requires `--virtio-blk-dedicated-threads` and must be
+between 1 and each disk's configured queue count.
+Without `--virtio-blk-dedicated-threads`, queues retain the default shared
 executor. These options apply to native `--virtio-blk` disks, not vhost-user
 devices.
 
-For example, four queues with the same aggregate 64-request limit per disk
-as the default configuration:
+For example, four independently scheduled queues with the same aggregate
+64-request limit per disk as the default configuration:
 
 ```sh
---virtio-blk-queues 4 --virtio-blk-io-depth 16
+--virtio-blk-queues 4 --virtio-blk-io-depth 16 --virtio-blk-dedicated-threads
 ```
+
+Add `--virtio-blk-io-threads 2` to serve those four queues with two I/O threads
+per disk without changing the per-queue or aggregate in-flight limits.
 
 Different disks can override the default independently, including selecting
 a single queue:
