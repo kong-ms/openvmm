@@ -277,6 +277,16 @@ impl VirtioBlkDevice {
             options.io_depth != 0,
             "virtio-blk I/O depth must be nonzero"
         );
+        if let Some(threads) = options.io_threads {
+            anyhow::ensure!(
+                options.dedicated_threads,
+                "virtio-blk I/O thread count requires dedicated threads"
+            );
+            anyhow::ensure!(
+                (1..=options.queue_count).contains(&threads),
+                "virtio-blk I/O thread count must be between 1 and the queue count"
+            );
+        }
         let serial = serial.map(parse_serial).transpose()?;
         let sector_count = disk.sector_count();
         let sector_size = disk.sector_size();
@@ -342,8 +352,20 @@ impl VirtioBlkDevice {
 
         let supports_discard = disk.unmap_behavior() != disk_backend::UnmapBehavior::Ignored;
 
+        let drivers: Vec<_> = if options.dedicated_threads {
+            (0..options.io_threads.unwrap_or(options.queue_count))
+                .map(|index| {
+                    driver_source
+                        .builder()
+                        .target_vp(u32::from(index))
+                        .build(format!("virtio-blk-{index}"))
+                })
+                .collect()
+        } else {
+            vec![driver_source.simple()]
+        };
         let workers = (0..options.queue_count)
-            .map(|_| QueueWorker {
+            .map(|index| QueueWorker {
                 worker: TaskControl::new(BlkWorker {
                     disk: disk.clone(),
                     read_only,
@@ -352,7 +374,7 @@ impl VirtioBlkDevice {
                     stats: WorkerStats::default(),
                     ios: FuturesUnordered::new(),
                 }),
-                driver: driver_source.simple(),
+                driver: drivers[usize::from(index) % drivers.len()].clone(),
             })
             .collect();
 
