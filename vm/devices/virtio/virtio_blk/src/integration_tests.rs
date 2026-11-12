@@ -38,11 +38,14 @@ use virtio::spec::queue::DescriptorFlags;
 use virtio::test_helpers::init_avail_ring;
 use virtio::test_helpers::init_used_ring;
 use virtio::test_helpers::make_available;
+use virtio::test_helpers::read_used_idx;
 use virtio::test_helpers::wait_for_used;
 use virtio::test_helpers::write_descriptor;
+use virtio_resources::blk::VirtioBlkOptions;
 use vmcore::interrupt::Interrupt;
 use vmcore::vm_task::SingleDriverBackend;
 use vmcore::vm_task::VmTaskDriverSource;
+use vmcore::vm_task::thread::ThreadDriverBackend;
 use zerocopy::IntoBytes;
 
 // --- Constants ---
@@ -117,28 +120,26 @@ impl TestHarness {
 
     /// Enable the device with one queue.
     async fn enable(&mut self) {
-        let interrupt = Interrupt::from_event(self.interrupt_event.clone());
-
+        let resources = self.resources();
         self.device
-            .start_queue(
-                0,
-                QueueResources {
-                    params: QueueParams {
-                        size: QUEUE_SIZE,
-                        enable: true,
-                        desc_addr: DESC_ADDR,
-                        avail_addr: AVAIL_ADDR,
-                        used_addr: USED_ADDR,
-                    },
-                    notify: interrupt,
-                    event: self.queue_event.clone(),
-                    guest_memory: self.mem.clone(),
-                },
-                &VirtioDeviceFeatures::new(),
-                None,
-            )
+            .start_queue(0, resources, &VirtioDeviceFeatures::new(), None)
             .await
             .unwrap();
+    }
+
+    fn resources(&self) -> QueueResources {
+        QueueResources {
+            params: QueueParams {
+                size: QUEUE_SIZE,
+                enable: true,
+                desc_addr: DESC_ADDR,
+                avail_addr: AVAIL_ADDR,
+                used_addr: USED_ADDR,
+            },
+            notify: Interrupt::from_event(self.interrupt_event.clone()),
+            event: self.queue_event.clone(),
+            guest_memory: self.mem.clone(),
+        }
     }
 
     /// Allocate a data region in guest memory and return its GPA.
@@ -218,8 +219,8 @@ impl TestHarness {
     ///   desc 1 (readable): data to write
     ///   desc 2 (writable): 1-byte status
     ///
-    /// Returns the head descriptor index.
-    fn post_write_request(&mut self, head_desc: u16, sector: u64, data: &[u8]) {
+    /// Returns the status byte GPA.
+    fn post_write_request(&mut self, head_desc: u16, sector: u64, data: &[u8]) -> u64 {
         let header_gpa = self.alloc_data(REQ_HEADER_SIZE);
         let data_gpa = self.alloc_data(data.len() as u32);
         let status_gpa = self.alloc_data(1);
@@ -282,6 +283,7 @@ impl TestHarness {
             &mut self.avail_idx,
         );
         self.queue_event.signal();
+        status_gpa
     }
 
     /// Build a flush request descriptor chain.
@@ -527,6 +529,311 @@ impl TestHarness {
 }
 
 // --- Tests ---
+
+#[async_test]
+async fn multiqueue_threads_complete_independently_and_restart(driver: DefaultDriver) {
+    let (started, started_recv) = async_channel::unbounded();
+    let (release, release_recv) = async_channel::bounded(1);
+    let disk = TestDisk4K::new(64 * 1024, 512)
+        .with_async_hook(move |write| {
+            let started = started.clone();
+            let release = release_recv.clone();
+            async move {
+                started
+                    .send((write, std::thread::current().id()))
+                    .await
+                    .unwrap();
+                if write {
+                    release.recv().await.unwrap();
+                }
+                Ok(())
+            }
+        })
+        .into_disk();
+    let source = VmTaskDriverSource::new(ThreadDriverBackend::new(driver.clone()));
+    let mut first = TestHarness::new(&driver, disk.clone(), false);
+    first.device = VirtioBlkDevice::with_options(
+        &source,
+        disk.clone(),
+        false,
+        None,
+        VirtioBlkOptions {
+            queue_count: 2,
+            io_depth: 1,
+            dedicated_threads: true,
+            io_threads: None,
+        },
+    )
+    .unwrap();
+    let mut second = TestHarness::new(&driver, disk, false);
+    let features = VirtioDeviceFeatures::new().with_device_specific_low(VIRTIO_BLK_F_MQ);
+    let resources = first.resources();
+    first
+        .device
+        .start_queue(0, resources, &features, None)
+        .await
+        .unwrap();
+    first
+        .device
+        .start_queue(1, second.resources(), &features, None)
+        .await
+        .unwrap();
+
+    let status = first.post_write_request(0, 0, &[0xa5; 512]);
+    let (write, writer_thread) = with_timeout(
+        &driver,
+        Duration::from_secs(5),
+        "first queue did not start its write",
+        started_recv.recv(),
+    )
+    .await
+    .unwrap();
+    assert!(write);
+    second.post_read_request(0, 1, 512);
+    assert_eq!(second.wait_for_used().await, (0, 513));
+    let (write, reader_thread) = started_recv.recv().await.unwrap();
+    assert!(!write);
+    assert_ne!(writer_thread, reader_thread);
+    assert_ne!(reader_thread, std::thread::current().id());
+    assert_eq!(read_used_idx(&first.mem, USED_ADDR), 0);
+
+    let saved = first.device.stop_queue(1).await.unwrap();
+    release.send(()).await.unwrap();
+    first.device.stop_queue(0).await.unwrap();
+    assert_eq!(first.wait_for_used().await, (0, 1));
+    assert_eq!(first.read_status(status), VIRTIO_BLK_S_OK);
+
+    first
+        .device
+        .start_queue(1, second.resources(), &features, Some(saved))
+        .await
+        .unwrap();
+    let data = second.post_read_request(2, 0, 512);
+    assert_eq!(second.wait_for_used().await, (2, 513));
+    let mut actual = [0; 512];
+    second.mem.read_at(data, &mut actual).unwrap();
+    assert_eq!(actual, [0xa5; 512]);
+    first.device.stop_queue(1).await.unwrap();
+}
+
+#[async_test]
+async fn multiqueue_shares_dedicated_threads_round_robin(driver: DefaultDriver) {
+    let (started, started_recv) = async_channel::unbounded();
+    let disk = TestDisk4K::new(64 * 1024, 512)
+        .with_async_hook(move |_| {
+            let started = started.clone();
+            async move {
+                started.send(std::thread::current().id()).await.unwrap();
+                Ok(())
+            }
+        })
+        .into_disk();
+    let source = VmTaskDriverSource::new(ThreadDriverBackend::new(driver.clone()));
+    let mut device = VirtioBlkDevice::with_options(
+        &source,
+        disk.clone(),
+        false,
+        None,
+        VirtioBlkOptions {
+            queue_count: 4,
+            io_depth: 1,
+            dedicated_threads: true,
+            io_threads: Some(2),
+        },
+    )
+    .unwrap();
+    let features = VirtioDeviceFeatures::new().with_device_specific_low(VIRTIO_BLK_F_MQ);
+    let mut queues: Vec<_> = (0..4)
+        .map(|_| TestHarness::new(&driver, disk.clone(), false))
+        .collect();
+    let mut threads = Vec::new();
+    for (index, queue) in queues.iter_mut().enumerate() {
+        device
+            .start_queue(
+                u16::try_from(index).unwrap(),
+                queue.resources(),
+                &features,
+                None,
+            )
+            .await
+            .unwrap();
+        queue.post_read_request(0, 0, 512);
+        assert_eq!(queue.wait_for_used().await, (0, 513));
+        threads.push(started_recv.recv().await.unwrap());
+    }
+    assert_eq!(threads[0], threads[2]);
+    assert_eq!(threads[1], threads[3]);
+    assert_ne!(threads[0], threads[1]);
+    assert!(threads.iter().all(|id| *id != std::thread::current().id()));
+
+    let saved = device.stop_queue(0).await.unwrap();
+    queues[2].post_read_request(2, 0, 512);
+    assert_eq!(queues[2].wait_for_used().await, (2, 513));
+    assert_eq!(started_recv.recv().await.unwrap(), threads[2]);
+    device
+        .start_queue(0, queues[0].resources(), &features, Some(saved))
+        .await
+        .unwrap();
+    queues[0].post_read_request(2, 0, 512);
+    assert_eq!(queues[0].wait_for_used().await, (2, 513));
+    assert_eq!(started_recv.recv().await.unwrap(), threads[0]);
+    for index in 0..4 {
+        device.stop_queue(index).await.unwrap();
+    }
+}
+
+#[async_test]
+async fn multiqueue_requires_negotiation_and_valid_queue_indices(driver: DefaultDriver) {
+    let source = VmTaskDriverSource::new(SingleDriverBackend::new(driver.clone()));
+    let disk = ram_disk(64 * 1024, false);
+    let mut harness = TestHarness::new(&driver, disk.clone(), false);
+    harness.device = VirtioBlkDevice::with_options(
+        &source,
+        disk.clone(),
+        false,
+        None,
+        VirtioBlkOptions {
+            queue_count: 2,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(harness.device.traits().max_queues, 2);
+    assert_ne!(
+        harness
+            .device
+            .traits()
+            .device_features
+            .device_specific_low()
+            & VIRTIO_BLK_F_MQ,
+        0
+    );
+    let resources = harness.resources();
+    assert!(
+        harness
+            .device
+            .start_queue(1, resources, &VirtioDeviceFeatures::new(), None)
+            .await
+            .is_err()
+    );
+    let resources = harness.resources();
+    assert!(
+        harness
+            .device
+            .start_queue(2, resources, &harness.device.traits().device_features, None)
+            .await
+            .is_err()
+    );
+    assert!(harness.device.stop_queue(2).await.is_none());
+    harness.enable().await;
+    harness.post_read_request(0, 0, 512);
+    assert_eq!(harness.wait_for_used().await, (0, 513));
+    harness.device.stop_queue(0).await.unwrap();
+
+    for (queue_count, io_depth) in [(0, 64), (257, 64), (1, 0)] {
+        assert!(
+            VirtioBlkDevice::with_options(
+                &source,
+                disk.clone(),
+                false,
+                None,
+                VirtioBlkOptions {
+                    queue_count,
+                    io_depth,
+                    dedicated_threads: false,
+                    io_threads: None,
+                },
+            )
+            .is_err()
+        );
+    }
+    for (dedicated_threads, io_threads) in [(false, 1), (true, 0), (true, 3)] {
+        assert!(
+            VirtioBlkDevice::with_options(
+                &source,
+                disk.clone(),
+                false,
+                None,
+                VirtioBlkOptions {
+                    queue_count: 2,
+                    dedicated_threads,
+                    io_threads: Some(io_threads),
+                    ..Default::default()
+                },
+            )
+            .is_err()
+        );
+    }
+}
+
+#[async_test]
+async fn configured_depth_backpressures_and_resumes_queue(driver: DefaultDriver) {
+    let (started, started_recv) = async_channel::unbounded();
+    let (release, release_recv) = async_channel::unbounded();
+    let disk = TestDisk4K::new(64 * 1024, 512)
+        .with_async_hook(move |_| {
+            let started = started.clone();
+            let release = release_recv.clone();
+            async move {
+                started.send(()).await.unwrap();
+                release.recv().await.unwrap();
+                Ok(())
+            }
+        })
+        .into_disk();
+    let source = VmTaskDriverSource::new(SingleDriverBackend::new(driver.clone()));
+    let mut harness = TestHarness::new(&driver, disk.clone(), false);
+    harness.device = VirtioBlkDevice::with_options(
+        &source,
+        disk,
+        false,
+        None,
+        VirtioBlkOptions {
+            io_depth: 2,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    harness.enable().await;
+    for head in [0, 2, 4] {
+        harness.post_read_request(head, 0, 512);
+    }
+    for _ in 0..2 {
+        with_timeout(
+            &driver,
+            Duration::from_secs(5),
+            "queue did not fill configured depth",
+            started_recv.recv(),
+        )
+        .await
+        .unwrap();
+    }
+    PolledTimer::new(&driver)
+        .sleep(Duration::from_millis(20))
+        .await;
+    assert!(started_recv.try_recv().is_err());
+    assert_eq!(read_used_idx(&harness.mem, USED_ADDR), 0);
+    release.send(()).await.unwrap();
+    with_timeout(
+        &driver,
+        Duration::from_secs(5),
+        "queue did not resume after an I/O completed",
+        started_recv.recv(),
+    )
+    .await
+    .unwrap();
+    release.send(()).await.unwrap();
+    release.send(()).await.unwrap();
+    let mut completed = Vec::new();
+    for _ in 0..3 {
+        let (head, len) = harness.wait_for_used().await;
+        assert_eq!(len, 513);
+        completed.push(head);
+    }
+    completed.sort();
+    assert_eq!(completed, [0, 2, 4]);
+    harness.device.stop_queue(0).await.unwrap();
+}
 
 fn ram_disk(size: u64, read_only: bool) -> Disk {
     disklayer_ram::ram_disk(size, read_only).unwrap()
@@ -840,6 +1147,9 @@ async fn sector_offset_correctness(driver: DefaultDriver) {
 
 // --- 4K-sector test disk ---
 
+type DiskHook =
+    Box<dyn Fn(bool) -> futures::future::BoxFuture<'static, Result<(), DiskError>> + Send + Sync>;
+
 /// A simple in-memory disk with configurable sector size, used to test the
 /// sector shift conversion path with non-512-byte sectors.
 #[derive(Inspect)]
@@ -850,6 +1160,8 @@ struct TestDisk4K {
     storage: Mutex<Vec<u8>>,
     #[inspect(skip)]
     supports_discard: bool,
+    #[inspect(skip)]
+    hook: Option<DiskHook>,
 }
 
 impl TestDisk4K {
@@ -861,7 +1173,21 @@ impl TestDisk4K {
             disk_id: None,
             storage: Mutex::new(vec![0u8; total_bytes]),
             supports_discard: false,
+            hook: None,
         }
+    }
+
+    fn with_async_hook<F, Fut>(mut self, hook: F) -> Self
+    where
+        F: Fn(bool) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<(), DiskError>> + Send + 'static,
+    {
+        self.hook = Some(Box::new(move |write| Box::pin(hook(write))));
+        self
+    }
+
+    fn into_disk(self) -> Disk {
+        Disk::new(self).unwrap()
     }
 
     fn with_disk_id(mut self, disk_id: [u8; 16]) -> Self {
@@ -909,6 +1235,9 @@ impl DiskIo for TestDisk4K {
         buffers: &RequestBuffers<'_>,
         sector: u64,
     ) -> Result<(), DiskError> {
+        if let Some(hook) = &self.hook {
+            hook(false).await?;
+        }
         let offset = sector as usize * self.sector_size as usize;
         let end = offset + buffers.len();
         let storage = self.storage.lock();
@@ -925,6 +1254,9 @@ impl DiskIo for TestDisk4K {
         sector: u64,
         _fua: bool,
     ) -> Result<(), DiskError> {
+        if let Some(hook) = &self.hook {
+            hook(true).await?;
+        }
         let offset = sector as usize * self.sector_size as usize;
         let end = offset + buffers.len();
         let mut storage = self.storage.lock();

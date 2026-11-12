@@ -507,6 +507,42 @@ PCIe root port. The syntax varies slightly between device types:
 The optional `serial` value accepts 1-20 printable ASCII bytes except commas
 and brackets. If omitted, OpenVMM uses the disk ID or `openvmm-virtio-blk`.
 
+Native virtio-blk concurrency is opt-in. Each disk accepts `num_queues=<COUNT>`
+to select 1-256 request queues. When omitted, `--virtio-blk-queues <COUNT>`
+supplies the default (1). `--virtio-blk-io-depth <COUNT>` limits in-flight
+requests per queue (default 64). Additional queues require the guest to negotiate
+`VIRTIO_BLK_F_MQ`; guests without it use queue 0.
+`--virtio-blk-dedicated-threads` uses dedicated task drivers; the standalone
+thread backend defaults to an independent I/O thread per queue.
+`--virtio-blk-io-threads <COUNT>` limits those threads per disk, with queues
+assigned round-robin. It requires `--virtio-blk-dedicated-threads` and must be
+between 1 and each disk's configured queue count.
+Without that flag, queues retain the default shared executor. These options
+apply to native `--virtio-blk` disks, not vhost-user devices.
+
+For example, four independently scheduled queues with the same aggregate
+64-request limit per disk as the default configuration:
+
+```sh
+--virtio-blk-queues 4 --virtio-blk-io-depth 16 --virtio-blk-dedicated-threads
+```
+
+Add `--virtio-blk-io-threads 2` to serve those four queues with two I/O threads
+per disk without changing the per-queue or aggregate in-flight limits.
+
+Different disks can override the default independently, including selecting
+a single queue:
+
+```sh
+--virtio-blk-queues 4 \
+  --virtio-blk file:/path/to/boot.raw,num_queues=1 \
+  --virtio-blk file:/path/to/data.raw,num_queues=8
+```
+
+The in-flight limit is per queue: eight queues at the default depth 64 allow
+512 concurrent requests per disk. This limit is separate from the virtqueue
+descriptor-ring size.
+
 **CXL test endpoint** (comma-separated option): `--cxl-test`
 
 ```sh

@@ -114,6 +114,14 @@ on the same backend do not. See
 [SMMU MSI translation](../iommu/smmuv3.md#msi-translation-and-acceleration)
 for the cache and fault-reporting behavior.
 
+### Virtio queue interrupts
+
+Native virtio PCI queues prepare event-backed MSI-X routes when supported.
+Software completions signal the kernel-bound event instead of injecting each
+interrupt through the userspace MSI backend. MSI-X masking and pending-bit
+handling still apply; destinations without a kernel binding retain userspace
+delivery. This does not change completion batching or queue configuration.
+
 ### Implementation notes
 
 ```admonish note title="No Command Completed support"
